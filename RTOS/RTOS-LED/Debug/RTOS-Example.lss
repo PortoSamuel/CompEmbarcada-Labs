@@ -18585,8 +18585,8 @@ static inline void stdio_serial_init(volatile void *usart, const usart_serial_op
   409ef4:	00444c50 	.word	0x00444c50
   409ef8:	25202d2d 	.word	0x25202d2d
   409efc:	000d0a73 	.word	0x000d0a73
-  409f00:	313a3231 	.word	0x313a3231
-  409f04:	30353a35 	.word	0x30353a35
+  409f00:	343a3231 	.word	0x343a3231
+  409f04:	32353a35 	.word	0x32353a35
   409f08:	00000000 	.word	0x00000000
   409f0c:	20727041 	.word	0x20727041
   409f10:	32203220 	.word	0x32203220
