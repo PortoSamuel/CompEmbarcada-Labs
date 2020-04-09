@@ -11,6 +11,13 @@
 #include "fonts/calibri_36.h"
 #include "fonts/arial_72.h"
 
+#define AFEC_POT AFEC1
+#define AFEC_POT_ID ID_AFEC1
+#define AFEC_POT_CHANNEL 6 // Canal do pino PC31
+
+/** The conversion data value */
+volatile uint32_t g_ul_value = 0;
+
 /************************************************************************/
 /* prototypes                                                           */
 /************************************************************************/
@@ -36,12 +43,20 @@ struct ili9488_opt_t g_ili9488_display_opt;
 #define TASK_LCD_STACK_SIZE            (4*1024/sizeof(portSTACK_TYPE))
 #define TASK_LCD_STACK_PRIORITY        (tskIDLE_PRIORITY)
 
+SemaphoreHandle_t xSemaphore_adc;
+
 typedef struct {
   uint x;
   uint y;
 } touchData;
 
+typedef struct {
+	uint value;
+} adcData;
+
 QueueHandle_t xQueueTouch;
+
+QueueHandle_t xQueueADC;
 
 /************************************************************************/
 /* handler/callbacks                                                    */
@@ -106,6 +121,50 @@ static void configure_lcd(void){
 
   /* Initialize LCD */
   ili9488_init(&g_ili9488_display_opt);
+}
+
+static void config_AFEC_pot(Afec *afec, uint32_t afec_id, uint32_t afec_channel, afec_callback_t callback){
+  /*************************************
+  * Ativa e configura AFEC
+  *************************************/
+  /* Ativa AFEC - 0 */
+  afec_enable(afec);
+
+  /* struct de configuracao do AFEC */
+  struct afec_config afec_cfg;
+
+  /* Carrega parametros padrao */
+  afec_get_config_defaults(&afec_cfg);
+
+  /* Configura AFEC */
+  afec_init(afec, &afec_cfg);
+
+  /* Configura trigger por software */
+  afec_set_trigger(afec, AFEC_TRIG_SW);
+
+  /*** Configuracao espec?fica do canal AFEC ***/
+  struct afec_ch_config afec_ch_cfg;
+  afec_ch_get_config_defaults(&afec_ch_cfg);
+  afec_ch_cfg.gain = AFEC_GAINVALUE_0;
+  afec_ch_set_config(afec, afec_channel, &afec_ch_cfg);
+
+  /*
+  * Calibracao:
+  * Because the internal ADC offset is 0x200, it should cancel it and shift
+  down to 0.
+  */
+  afec_channel_set_analog_offset(afec, afec_channel, 0x200);
+
+  /***  Configura sensor de temperatura ***/
+  struct afec_temp_sensor_config afec_temp_sensor_cfg;
+
+  afec_temp_sensor_get_config_defaults(&afec_temp_sensor_cfg);
+  afec_temp_sensor_set_config(afec, &afec_temp_sensor_cfg);
+  
+  /* configura IRQ */
+  afec_set_callback(afec, afec_channel,	callback, 1);
+  NVIC_SetPriority(afec_id, 4);
+  NVIC_EnableIRQ(afec_id);
 }
 
 /************************************************************************/
@@ -202,6 +261,7 @@ void task_mxt(void){
 
 void task_lcd(void){
   xQueueTouch = xQueueCreate( 10, sizeof( touchData ) );
+  xQueueADC   = xQueueCreate( 5, sizeof( adcData ) );
   
   // inicializa LCD e pinta de branco
   configure_lcd();
@@ -215,10 +275,62 @@ void task_lcd(void){
   
   // strut local para armazenar msg enviada pela task do mxt
   touchData touch;
+  adcData adc;
   
   while (true) {
     if (xQueueReceive( xQueueTouch, &(touch), ( TickType_t )  500 / portTICK_PERIOD_MS)) {
       printf("Touch em: x:%d y:%d\n", touch.x, touch.y);
+    }
+	
+	// Busca um novo valor na fila do adc!
+    // formata
+    // e imprime no LCD o dado
+    if (xQueueReceive( xQueueADC, &(adc), ( TickType_t )  100 / portTICK_PERIOD_MS)) {
+      char b[512];
+      sprintf(b, "%04d", adc.value);
+      font_draw_text(&arial_72, b, 50, 200, 2);
+	}
+  }
+}
+
+static void AFEC_pot_Callback(void){
+	g_ul_value = afec_channel_get_value(AFEC_POT, AFEC_POT_CHANNEL);
+
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    printf("AFEC_pot_Callback \n");
+    xSemaphoreGiveFromISR(xSemaphore_adc, &xHigherPriorityTaskWoken);
+    printf("semafaro adc \n");
+	
+}
+
+void task_adc(void){
+	xSemaphore_adc = xSemaphoreCreateBinary();
+	
+  /* inicializa e configura adc */
+  config_AFEC_pot(AFEC_POT, AFEC_POT_ID, AFEC_POT_CHANNEL, AFEC_pot_Callback);
+
+  /* Selecina canal e inicializa convers?o */
+  afec_channel_enable(AFEC_POT, AFEC_POT_CHANNEL);
+  afec_start_software_conversion(AFEC_POT);
+  
+  adcData adc;
+
+  while(1){
+	if (xSemaphore_adc == NULL) {
+		printf("falha em criar o semaforo \n");
+	}
+	
+    if( xSemaphoreTake(xSemaphore_adc, ( TickType_t ) 500) == pdTRUE ){
+      printf("%d\n", g_ul_value);
+	  
+	  adc.value = g_ul_value;
+      xQueueSend(xQueueADC, &adc, 0);
+	  
+      vTaskDelay(500);
+
+      /* Selecina canal e inicializa convers?o */
+      afec_channel_enable(AFEC_POT, AFEC_POT_CHANNEL);
+      afec_start_software_conversion(AFEC_POT);
     }
   }
 }
@@ -253,11 +365,34 @@ int main(void)
     printf("Failed to create test led task\r\n");
   }
   
+  /* Create task to handler LCD */
+  if (xTaskCreate(task_adc, "adc", TASK_LCD_STACK_SIZE, NULL, TASK_LCD_STACK_PRIORITY, NULL) != pdPASS) {
+    printf("Failed to create test adc task\r\n");
+  }
+  
   /* Start the scheduler. */
   vTaskStartScheduler();
-
+	
+	/**
+	// inicializa e configura adc
+	config_AFEC_pot(AFEC_POT, AFEC_POT_ID, AFEC_POT_CHANNEL, AFEC_pot_Callback);
+	
+	// Selecina canal e inicializa convers?o
+	afec_channel_enable(AFEC_POT, AFEC_POT_CHANNEL);
+	afec_start_software_conversion(AFEC_POT);
+	**/
+	
   while(1){
-
+		/**
+	    if(g_is_conversion_done){
+		    printf("%d\n", g_ul_value);
+		    delay_ms(500);
+		    
+		    // Selecina canal e inicializa convers?o
+		    afec_channel_enable(AFEC_POT, AFEC_POT_CHANNEL);
+		    afec_start_software_conversion(AFEC_POT);
+	    }
+		**/
   }
 
 
